@@ -632,6 +632,8 @@ pub enum GuestMemoryFromUffdError {
     Register(userfaultfd::Error),
     /// Failed to open the shared guest memory file: {0}
     OpenSharedFile(std::io::Error),
+    /// Cannot use huge pages with a shared guest memory file
+    SharedFileHugePages,
     /// Failed to register memory address range for missing and minor faults: {0}
     RegisterMinor(std::io::Error),
     /// Failed to connect to UDS Unix stream: {0}
@@ -740,6 +742,10 @@ fn create_guest_memory_shared_file(
     track_dirty_pages: bool,
     huge_pages: HugePageConfig,
 ) -> Result<(Vec<GuestRegionMmap>, Vec<GuestRegionUffdMapping>), GuestMemoryFromUffdError> {
+    // A MAP_PRIVATE mapping of a tmpfs file faults and copies in base pages, never huge pages.
+    if huge_pages != HugePageConfig::None {
+        return Err(GuestMemoryFromUffdError::SharedFileHugePages);
+    }
     let file = File::open(path).map_err(GuestMemoryFromUffdError::OpenSharedFile)?;
     let guest_memory =
         memory::snapshot_file(file, &mem_state.regions(), track_dirty_pages, huge_pages)?;
@@ -1309,6 +1315,26 @@ mod tests {
                 MemoryError::OffsetTooLarge
             ))
         ));
+    }
+
+    #[test]
+    fn test_shared_file_rejects_huge_pages() {
+        let tmp = TempFile::new_with_prefix("/dev/shm/fc-shared-uffd-").unwrap();
+        tmp.as_file().set_len(0x400000).unwrap();
+
+        for huge_pages in [HugePageConfig::Transparent, HugePageConfig::Hugetlbfs2M] {
+            let result = create_guest_memory_shared_file(
+                tmp.as_path(),
+                &shared_file_mem_state(0x400000),
+                false,
+                huge_pages,
+            );
+
+            assert!(
+                matches!(result, Err(GuestMemoryFromUffdError::SharedFileHugePages)),
+                "{huge_pages:?}"
+            );
+        }
     }
 
     #[test]
