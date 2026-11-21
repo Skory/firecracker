@@ -190,6 +190,9 @@ Constraints:
   huge pages.
 - Minor faults on tmpfs need Linux 5.14 or later. On older kernels, the restore
   fails when Firecracker registers guest memory.
+- Firecracker refuses to write a snapshot of a shared-mode microVM into its own
+  shared file, or through a link to it, because other microVMs map that file.
+  A snapshot written to any other file contains the microVM's private writes.
 
 The balloon behaves differently in shared memory mode. Guest memory is a
 private file mapping, so Firecracker frees a balloon range by mapping new

@@ -21,6 +21,29 @@ use crate::{EventManager, Vmm};
 
 pub mod mock_resources;
 
+/// Creates a non-blocking, user-mode-only userfaultfd with the API handshake done.
+///
+/// `/dev/userfaultfd` is root-only on most hosts and the `userfaultfd` crate will not fall back
+/// to the syscall, so this issues the syscall directly. The kernel fails poll() on a blocking
+/// userfaultfd, hence `O_NONBLOCK`.
+pub fn user_mode_uffd() -> userfaultfd::Uffd {
+    const UFFD_USER_MODE_ONLY: i32 = 1;
+    const UFFD_API: u64 = 0xAA;
+    const UFFDIO_API: u32 = 0xC018_AA3F;
+    let flags = libc::O_CLOEXEC | libc::O_NONBLOCK | UFFD_USER_MODE_ONLY;
+    // SAFETY: plain syscall; the returned fd is owned by `uffd` below.
+    let fd = unsafe { libc::syscall(libc::SYS_userfaultfd, flags) };
+    let fd = i32::try_from(fd).unwrap();
+    assert!(fd >= 0, "{}", std::io::Error::last_os_error());
+    // SAFETY: `fd` is a fresh userfaultfd descriptor that nothing else owns.
+    let uffd = unsafe { <userfaultfd::Uffd as std::os::fd::FromRawFd>::from_raw_fd(fd) };
+    let mut api = [UFFD_API, 0, 0];
+    // SAFETY: `api` matches `struct uffdio_api`.
+    let ret = unsafe { libc::ioctl(fd, UFFDIO_API as libc::Ioctl, api.as_mut_ptr()) };
+    assert_eq!(ret, 0, "{}", std::io::Error::last_os_error());
+    uffd
+}
+
 /// Creates a [`GuestMemoryMmap`] with a single region of the given size starting at guest
 /// physical address 0 and without dirty tracking.
 pub fn single_region_mem(region_size: usize) -> GuestMemoryMmap {
