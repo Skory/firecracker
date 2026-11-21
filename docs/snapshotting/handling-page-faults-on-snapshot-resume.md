@@ -229,4 +229,5 @@ An example of a handler process can be found
 [here](../../src/firecracker/examples/uffd/on_demand_handler.rs). The process is
 designed to tackle faults on a certain address by loading into memory the entire
 region that the address belongs to, but users can choose any other behavior that
-suits their use case best.
+suits their use case best. Given a third argument, the path of a shared memory
+file, it serves [shared memory mode](#shared-memory-mode) instead.
