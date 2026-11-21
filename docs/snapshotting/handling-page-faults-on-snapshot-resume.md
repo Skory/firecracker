@@ -141,6 +141,65 @@ with `UFFD_EVENT_REMOVE`. We recommend using the jailer's built-in cgroup
 functionality as defense in depth, in order to limit resource usage of the
 Firecracker process.
 
+### Shared memory mode
+
+When several microVMs on one host restore from the same snapshot, each one
+normally holds its own copy of guest memory. In shared memory mode, unmodified
+pages are stored once per host.
+
+To use it, set `shared_file_path` in the `Uffd` memory backend of
+`PUT /snapshot/load`:
+
+```json
+"mem_backend": {
+    "backend_type": "Uffd",
+    "backend_path": "/path/to/uffd.socket",
+    "shared_file_path": "/dev/shm/snapshot.mem"
+}
+```
+
+The shared file lives on tmpfs, and every microVM restored from the snapshot
+uses the same file. The page fault handler fills it lazily, at the same offsets
+as the snapshot memory file. Firecracker maps the file `MAP_PRIVATE` and
+registers guest memory for both missing and minor faults. The handshake is the
+same as in the default mode.
+
+The page fault handler must resolve faults as follows:
+
+- **Missing fault:** the page is not in the shared file yet. Write the page
+  into the shared file, then issue `UFFDIO_CONTINUE` for it.
+- **Minor fault:** the page is already in the shared file, for example because
+  the handler filled it for another microVM. Issue `UFFDIO_CONTINUE`.
+- **Never use `UFFDIO_COPY`.** In a private file mapping, `UFFDIO_COPY` installs
+  a private anonymous page and leaves the hole in the file. The guest still
+  reads the right data, but the page is not shared, and nothing reports the
+  error.
+- **Write each page into the shared file only once.** A microVM sees later
+  changes to the file for every page it has not written to yet.
+
+A guest write copies the page into memory private to that microVM, so the
+shared file never changes after the handler fills it.
+
+Constraints:
+
+- The shared file must be at least as large as guest memory. Firecracker
+  refuses to map a shorter file, because a guest access past the end of a tmpfs
+  file raises `SIGBUS`, which userfaultfd cannot catch.
+- Huge pages are not supported. A private mapping of a tmpfs file faults in
+  base pages, so Firecracker rejects shared mode with `Transparent` or `2M`
+  huge pages.
+- Minor faults on tmpfs need Linux 5.14 or later. On older kernels, the restore
+  fails when Firecracker registers guest memory.
+
+The balloon behaves differently in shared memory mode. Guest memory is a
+private file mapping, so Firecracker frees a balloon range by mapping new
+anonymous memory over it, as it does after a restore with the `File` backend.
+The guest reads zeros from the range afterwards. The new mapping is not
+registered with userfaultfd, so the page fault handler receives no
+`UFFD_EVENT_REMOVE` and no further faults for that range. Each such range also
+splits the guest memory mapping, which raises the number of memory mappings
+(VMAs) of the Firecracker process.
+
 ### Caveats
 
 If the handler process crashes while Firecracker is resuming the snapshot,
