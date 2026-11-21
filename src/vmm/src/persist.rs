@@ -167,6 +167,8 @@ pub enum CreateSnapshotError {
     SerializeMicrovmState(#[from] crate::snapshot::SnapshotError),
     /// Cannot perform {0} on the snapshot backing file: {1}
     SnapshotBackingFile(&'static str, io::Error),
+    /// Cannot write the memory snapshot to the shared guest memory file, which other microVMs map
+    SharedMemoryFile,
 }
 
 /// Snapshot version
@@ -1188,9 +1190,6 @@ mod tests {
         use std::os::unix::fs::FileExt;
         const PAGE: usize = 4096;
         const SIZE: usize = 0x20000;
-        const UFFD_USER_MODE_ONLY: i32 = 1;
-        const UFFD_API: u64 = 0xAA;
-        const UFFDIO_API: u32 = 0xC018_AA3F;
         const UFFDIO_CONTINUE: u32 = 0xC020_AA07;
         const UFFD_EVENT_PAGEFAULT: u8 = 0x12;
         const FLAG_MINOR: u64 = 4;
@@ -1210,20 +1209,7 @@ mod tests {
         .unwrap();
         let base = mappings[0].base_host_virt_addr;
 
-        // `/dev/userfaultfd` is root-only on most hosts and the crate will not fall back to the
-        // syscall, so create a user-mode-only descriptor directly.
-        // The kernel fails poll() on a blocking userfaultfd, hence O_NONBLOCK.
-        let flags = libc::O_CLOEXEC | libc::O_NONBLOCK | UFFD_USER_MODE_ONLY;
-        // SAFETY: plain syscall; the returned fd is owned by `uffd` below.
-        let fd = unsafe { libc::syscall(libc::SYS_userfaultfd, flags) };
-        let fd = i32::try_from(fd).unwrap();
-        assert!(fd >= 0, "{}", std::io::Error::last_os_error());
-        // SAFETY: `fd` is a fresh userfaultfd descriptor that nothing else owns.
-        let uffd = unsafe { <Uffd as std::os::fd::FromRawFd>::from_raw_fd(fd) };
-        let mut api = [UFFD_API, 0, 0];
-        // SAFETY: `api` matches `struct uffdio_api`.
-        let ret = unsafe { libc::ioctl(fd, UFFDIO_API as libc::Ioctl, api.as_mut_ptr()) };
-        assert_eq!(ret, 0, "{}", std::io::Error::last_os_error());
+        let uffd = crate::test_utils::user_mode_uffd();
         register_missing_and_minor(&uffd, base, SIZE as u64).unwrap();
 
         let guest = std::thread::spawn(move || {

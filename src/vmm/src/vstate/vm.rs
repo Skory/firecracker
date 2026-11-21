@@ -670,6 +670,20 @@ impl KvmVm {
     ) -> Result<(), CreateSnapshotError> {
         use self::CreateSnapshotError::*;
 
+        // In uffd shared memory mode, other microVMs map the shared file too, and they would see
+        // these writes in every page they have not written to themselves.
+        if let Some(shared) = self.shared_memory_file()
+            && let Ok(target) = std::fs::metadata(mem_file_path)
+        {
+            use std::os::unix::fs::MetadataExt;
+            let shared = shared
+                .metadata()
+                .map_err(|err| MemoryBackingFile("get_metadata", err))?;
+            if (target.dev(), target.ino()) == (shared.dev(), shared.ino()) {
+                return Err(SharedMemoryFile);
+            }
+        }
+
         // Need to check this here, as we create the file in the line below
         let file_existed = mem_file_path.exists();
 
@@ -708,6 +722,16 @@ impl KvmVm {
             .map_err(|e| MemoryBackingFile("set_length", e))?;
 
         self.snapshot_memory_to_file(&mut file, snapshot_type, sync_snapshot_files)
+    }
+
+    /// The file that guest memory maps in uffd shared memory mode. Restoring with the uffd backend
+    /// otherwise uses anonymous memory.
+    fn shared_memory_file(&self) -> Option<&File> {
+        self.common.uffd.as_ref()?;
+        self.guest_memory()
+            .iter()
+            .find_map(|region| region.file_offset())
+            .map(|file_offset| file_offset.file())
     }
 
     /// Writes guest memory to `file` as a snapshot of `snapshot_type`, taking the dirty pages it
@@ -1116,6 +1140,63 @@ pub(crate) mod tests {
 
         let dram = vm.guest_memory().iter().next().unwrap();
         assert!(dram.bitmap().dirty_at(page_size));
+    }
+
+    #[test]
+    fn test_snapshot_of_shared_memory_vm() {
+        use std::os::unix::fs::FileExt;
+
+        use vmm_sys_util::tempfile::TempFile;
+
+        use crate::vstate::memory::{Bytes, snapshot_file};
+
+        let page_size = host_page_size();
+        let size = 4 * page_size;
+        let shared = TempFile::new_with_prefix("/dev/shm/fc-shared-mem-").unwrap();
+        shared.as_file().write_all_at(&vec![0xAA; size], 0).unwrap();
+        let mut vm = setup_vm();
+        let regions = snapshot_file(
+            shared.as_file().try_clone().unwrap(),
+            &[(GuestAddress(0), size)],
+            false,
+            HugePageConfig::None,
+        )
+        .unwrap();
+        vm.register_dram_memory_regions(regions).unwrap();
+        vm.set_uffd(Some(crate::test_utils::user_mode_uffd()));
+        // A guest write copies the page privately.
+        vm.guest_memory()
+            .write(&[0x11], GuestAddress(page_size as u64))
+            .unwrap();
+        let read_page = |file: &File, page: usize| {
+            let mut buf = vec![0; page_size];
+            file.read_exact_at(&mut buf, (page * page_size) as u64)
+                .unwrap();
+            buf
+        };
+
+        // Writing the snapshot into the shared file, or through a link to it, is refused, and the
+        // shared file keeps its contents.
+        let link = TempFile::new_with_prefix("/dev/shm/fc-shared-link-").unwrap();
+        std::fs::remove_file(link.as_path()).unwrap();
+        std::os::unix::fs::symlink(shared.as_path(), link.as_path()).unwrap();
+        for target in [shared.as_path(), link.as_path()] {
+            let result = vm.snapshot_memory_to_path(target, SnapshotType::Full, false);
+            assert!(
+                matches!(result, Err(CreateSnapshotError::SharedMemoryFile)),
+                "{target:?}"
+            );
+        }
+        assert_eq!(read_page(shared.as_file(), 1), vec![0xAA; page_size]);
+
+        // Another file gets the private write and the shared pages.
+        let snapshot = TempFile::new().unwrap();
+        vm.snapshot_memory_to_path(snapshot.as_path(), SnapshotType::Full, false)
+            .unwrap();
+        let mut expected = vec![0xAA; page_size];
+        expected[0] = 0x11;
+        assert_eq!(read_page(snapshot.as_file(), 1), expected);
+        assert_eq!(read_page(snapshot.as_file(), 0), vec![0xAA; page_size]);
     }
 
     // Auxiliary function being used throughout the tests.
