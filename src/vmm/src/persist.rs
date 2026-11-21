@@ -495,6 +495,7 @@ pub fn restore_from_snapshot(
         }
         MemBackendType::Uffd => guest_memory_from_uffd(
             mem_backend_path,
+            params.mem_backend.shared_file_path.as_deref(),
             mem_state,
             track_dirty_pages,
             vm_resources.machine_config.huge_pages,
@@ -644,6 +645,7 @@ pub enum GuestMemoryFromUffdError {
 
 fn guest_memory_from_uffd(
     mem_uds_path: &Path,
+    shared_file: Option<&Path>,
     mem_state: &GuestMemoryState,
     track_dirty_pages: bool,
     huge_pages: HugePageConfig,
@@ -652,14 +654,10 @@ fn guest_memory_from_uffd(
     // fault handler fills lazily. Faults on pages missing from the file are MISSING faults;
     // faults on pages already in the file's page cache (filled for another VM) are MINOR
     // faults, resolved with UFFDIO_CONTINUE. Guest writes copy the page privately.
-    let shared_file = std::env::var_os("FC_UFFD_SHARED_MEM_FILE");
-    let (guest_memory, backend_mappings) = match &shared_file {
-        Some(path) => create_guest_memory_shared_file(
-            Path::new(path),
-            mem_state,
-            track_dirty_pages,
-            huge_pages,
-        )?,
+    let (guest_memory, backend_mappings) = match shared_file {
+        Some(path) => {
+            create_guest_memory_shared_file(path, mem_state, track_dirty_pages, huge_pages)?
+        }
         None => create_guest_memory(mem_state, track_dirty_pages, huge_pages)?,
     };
 
@@ -994,6 +992,7 @@ mod tests {
             mem_backend: MemBackendConfig {
                 backend_path: PathBuf::new(),
                 backend_type: MemBackendType::File,
+                shared_file_path: None,
             },
             track_dirty_pages: false,
             resume_vm: false,

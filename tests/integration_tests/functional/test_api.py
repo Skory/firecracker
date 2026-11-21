@@ -1917,6 +1917,20 @@ def test_negative_snapshot_load_api(microvm_factory):
             mem_backend={"backend_type": "foo", "backend_path": "bar"},
         )
 
+    # `shared_file_path` with a backend other than `Uffd` should fail.
+    with pytest.raises(
+        RuntimeError,
+        match="`mem_backend.shared_file_path` is only supported with the `Uffd`",
+    ):
+        vm.api.snapshot_load.put(
+            snapshot_path="foo",
+            mem_backend={
+                "backend_type": "File",
+                "backend_path": "bar",
+                "shared_file_path": "baz",
+            },
+        )
+
     # API request without `snapshot_path` should fail.
     with pytest.raises(RuntimeError, match="missing field `snapshot_path`"):
         vm.api.snapshot_load.put(

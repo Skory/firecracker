@@ -202,6 +202,11 @@ pub struct MemBackendConfig {
     pub backend_path: PathBuf,
     /// Specifies the guest memory backend type.
     pub backend_type: MemBackendType,
+    /// `Uffd` only: path to a file on tmpfs, shared by every VM restored from the same snapshot,
+    /// that the page fault handler fills lazily. Guest memory maps it `MAP_PRIVATE`, so unmodified
+    /// pages are stored once per host and a guest write copies the page for that VM.
+    #[serde(default)]
+    pub shared_file_path: Option<PathBuf>,
 }
 
 /// The microVM state options.

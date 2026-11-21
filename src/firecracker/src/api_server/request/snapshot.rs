@@ -22,6 +22,9 @@ pub const MISSING_FIELD: &str =
 /// Only specifying one of them is allowed.
 pub const TOO_MANY_FIELDS: &str =
     "too many fields: either `mem_backend` or `mem_file_path` exclusively is required";
+/// `shared_file_path` has been specified with a backend other than `Uffd`.
+pub const SHARED_FILE_WITHOUT_UFFD: &str =
+    "`mem_backend.shared_file_path` is only supported with the `Uffd` backend type";
 
 pub(crate) fn parse_put_snapshot(
     body: &Body,
@@ -78,6 +81,15 @@ fn parse_put_snapshot_load(body: &Body) -> Result<ParsedRequest, RequestError> {
         _ => {}
     }
 
+    if let Some(backend) = &snapshot_config.mem_backend
+        && backend.shared_file_path.is_some()
+        && backend.backend_type != MemBackendType::Uffd
+    {
+        return Err(RequestError::SerdeJson(serde_json::Error::custom(
+            SHARED_FILE_WITHOUT_UFFD,
+        )));
+    }
+
     // Check for the presence of deprecated `mem_file_path` field and create
     // deprecation message if found.
     let mut deprecation_message = None;
@@ -98,6 +110,7 @@ fn parse_put_snapshot_load(body: &Body) -> Result<ParsedRequest, RequestError> {
                 // either `mem_file_path` or `mem_backend` field is always specified.
                 backend_path: snapshot_config.mem_file_path.unwrap(),
                 backend_type: MemBackendType::File,
+                shared_file_path: None,
             }
         }
     };
@@ -211,6 +224,7 @@ mod tests {
             mem_backend: MemBackendConfig {
                 backend_path: PathBuf::from("bar"),
                 backend_type: MemBackendType::File,
+                shared_file_path: None,
             },
             track_dirty_pages: false,
             resume_vm: false,
@@ -246,6 +260,7 @@ mod tests {
             mem_backend: MemBackendConfig {
                 backend_path: PathBuf::from("bar"),
                 backend_type: MemBackendType::File,
+                shared_file_path: None,
             },
             track_dirty_pages: true,
             resume_vm: false,
@@ -282,6 +297,7 @@ mod tests {
             mem_backend: MemBackendConfig {
                 backend_path: PathBuf::from("bar"),
                 backend_type: MemBackendType::Uffd,
+                shared_file_path: None,
             },
             track_dirty_pages: false,
             resume_vm: true,
@@ -323,6 +339,7 @@ mod tests {
             mem_backend: MemBackendConfig {
                 backend_path: PathBuf::from("bar"),
                 backend_type: MemBackendType::Uffd,
+                shared_file_path: None,
             },
             track_dirty_pages: false,
             resume_vm: true,
@@ -376,6 +393,7 @@ mod tests {
             mem_backend: MemBackendConfig {
                 backend_path: PathBuf::from("bar"),
                 backend_type: MemBackendType::File,
+                shared_file_path: None,
             },
             track_dirty_pages: false,
             resume_vm: false,
@@ -414,6 +432,7 @@ mod tests {
             mem_backend: MemBackendConfig {
                 backend_path: PathBuf::from("bar"),
                 backend_type: MemBackendType::File,
+                shared_file_path: None,
             },
             track_dirty_pages: false,
             resume_vm: true,
@@ -543,6 +562,49 @@ mod tests {
         );
         parse_put_snapshot(&Body::new(body), Some("invalid")).unwrap_err();
         parse_put_snapshot(&Body::new(body), None).unwrap_err();
+    }
+
+    #[test]
+    fn test_parse_put_snapshot_load_shared_file() {
+        use std::path::PathBuf;
+
+        let body = r#"{
+            "snapshot_path": "foo",
+            "mem_backend": {
+                "backend_path": "bar",
+                "backend_type": "Uffd",
+                "shared_file_path": "/dev/shm/baz"
+            }
+        }"#;
+        let VmmAction::LoadSnapshot(params) =
+            vmm_action_from_request(parse_put_snapshot(&Body::new(body), Some("load")).unwrap())
+        else {
+            panic!("expected LoadSnapshot");
+        };
+        assert_eq!(
+            params.mem_backend,
+            MemBackendConfig {
+                backend_path: PathBuf::from("bar"),
+                backend_type: MemBackendType::Uffd,
+                shared_file_path: Some(PathBuf::from("/dev/shm/baz")),
+            }
+        );
+
+        let body = r#"{
+            "snapshot_path": "foo",
+            "mem_backend": {
+                "backend_path": "bar",
+                "backend_type": "File",
+                "shared_file_path": "/dev/shm/baz"
+            }
+        }"#;
+        assert_eq!(
+            parse_put_snapshot(&Body::new(body), Some("load"))
+                .unwrap_err()
+                .to_string(),
+            RequestError::SerdeJson(serde_json::Error::custom(SHARED_FILE_WITHOUT_UFFD))
+                .to_string()
+        );
     }
 
     #[test]

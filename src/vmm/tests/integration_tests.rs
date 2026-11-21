@@ -370,6 +370,7 @@ fn verify_load_snapshot(
             mem_backend: MemBackendConfig {
                 backend_path: memory_file.as_path().to_path_buf(),
                 backend_type: MemBackendType::File,
+                shared_file_path: None,
             },
             track_dirty_pages: false,
             resume_vm: true,
@@ -444,6 +445,7 @@ fn test_load_snapshot_rejects_hugetlbfs_with_file_backend() {
             mem_backend: MemBackendConfig {
                 backend_path: memory_file.as_path().to_path_buf(),
                 backend_type: MemBackendType::File,
+                shared_file_path: None,
             },
             track_dirty_pages: false,
             resume_vm: false,
@@ -519,6 +521,7 @@ fn verify_load_snap_disallowed_after_boot_resources(res: VmmAction, res_name: &s
         mem_backend: MemBackendConfig {
             backend_path: memory_file.as_path().to_path_buf(),
             backend_type: MemBackendType::File,
+            shared_file_path: None,
         },
         track_dirty_pages: false,
         resume_vm: false,

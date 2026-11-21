@@ -1415,6 +1415,7 @@ mod tests {
                 snapshot_path: PathBuf::new(),
                 mem_backend: MemBackendConfig {
                     backend_type: MemBackendType::File,
+                    shared_file_path: None,
                     backend_path: PathBuf::new(),
                 },
                 track_dirty_pages: false,

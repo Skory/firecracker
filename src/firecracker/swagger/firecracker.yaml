@@ -1788,6 +1788,15 @@ definitions:
           2) Path to the UDS where a process is listening for a UFFD initialization
           control payload and open file descriptor that it can use to serve this
           process's guest memory page faults
+      shared_file_path:
+        type: string
+        description: Only valid with the 'Uffd' backend type. Path to a file on
+          tmpfs, shared by every microVM restored from the same snapshot, that the
+          page fault handler fills lazily. Guest memory maps it MAP_PRIVATE and is
+          registered for missing and minor faults, so unmodified pages are stored
+          once per host and a guest write copies the page for that microVM. The
+          file must be at least as large as guest memory, and huge pages are not
+          supported.
 
   Metrics:
     type: object
