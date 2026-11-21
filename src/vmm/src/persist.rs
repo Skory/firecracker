@@ -630,6 +630,10 @@ pub enum GuestMemoryFromUffdError {
     Create(userfaultfd::Error),
     /// Failed to register memory address range with the userfaultfd object: {0}
     Register(userfaultfd::Error),
+    /// Failed to open the shared guest memory file: {0}
+    OpenSharedFile(std::io::Error),
+    /// Failed to register memory address range for missing and minor faults: {0}
+    RegisterMinor(std::io::Error),
     /// Failed to connect to UDS Unix stream: {0}
     Connect(#[from] std::io::Error),
     /// Failed to sends file descriptor: {0}
@@ -642,8 +646,20 @@ fn guest_memory_from_uffd(
     track_dirty_pages: bool,
     huge_pages: HugePageConfig,
 ) -> Result<(Vec<GuestRegionMmap>, Option<Uffd>), GuestMemoryFromUffdError> {
-    let (guest_memory, backend_mappings) =
-        create_guest_memory(mem_state, track_dirty_pages, huge_pages)?;
+    // Shared mode: guest memory is a MAP_PRIVATE mapping of a file on tmpfs that the page
+    // fault handler fills lazily. Faults on pages missing from the file are MISSING faults;
+    // faults on pages already in the file's page cache (filled for another VM) are MINOR
+    // faults, resolved with UFFDIO_CONTINUE. Guest writes copy the page privately.
+    let shared_file = std::env::var_os("FC_UFFD_SHARED_MEM_FILE");
+    let (guest_memory, backend_mappings) = match &shared_file {
+        Some(path) => create_guest_memory_shared_file(
+            Path::new(path),
+            mem_state,
+            track_dirty_pages,
+            huge_pages,
+        )?,
+        None => create_guest_memory(mem_state, track_dirty_pages, huge_pages)?,
+    };
 
     let mut uffd_builder = UffdBuilder::new();
 
@@ -661,13 +677,73 @@ fn guest_memory_from_uffd(
         .map_err(GuestMemoryFromUffdError::Create)?;
 
     for mem_region in guest_memory.iter() {
-        uffd.register(mem_region.as_ptr().cast(), mem_region.size() as _)
-            .map_err(GuestMemoryFromUffdError::Register)?;
+        if shared_file.is_some() {
+            register_missing_and_minor(
+                &uffd,
+                mem_region.as_ptr() as u64,
+                mem_region.size() as u64,
+            )?;
+        } else {
+            uffd.register(mem_region.as_ptr().cast(), mem_region.size() as _)
+                .map_err(GuestMemoryFromUffdError::Register)?;
+        }
     }
 
     send_uffd_handshake(mem_uds_path, &backend_mappings, &uffd)?;
 
     Ok((guest_memory, Some(uffd)))
+}
+
+// The `userfaultfd` crate registers minor faults only behind its `linux5_13` feature, which
+// regenerates kernel bindings at build time, so this issues the ioctl directly.
+fn register_missing_and_minor(
+    uffd: &Uffd,
+    start: u64,
+    len: u64,
+) -> Result<(), GuestMemoryFromUffdError> {
+    #[repr(C)]
+    struct UffdioRegister {
+        start: u64,
+        len: u64,
+        mode: u64,
+        ioctls: u64,
+    }
+    const UFFDIO_REGISTER: u32 = 0xC020_AA00;
+    const UFFDIO_REGISTER_MODE_MISSING: u64 = 1;
+    const UFFDIO_REGISTER_MODE_MINOR: u64 = 4;
+    let mut reg = UffdioRegister {
+        start,
+        len,
+        mode: UFFDIO_REGISTER_MODE_MISSING | UFFDIO_REGISTER_MODE_MINOR,
+        ioctls: 0,
+    };
+    // SAFETY: `uffd` is a valid userfaultfd descriptor and `reg` matches the kernel's
+    // `struct uffdio_register` layout.
+    let ret = unsafe {
+        libc::ioctl(
+            uffd.as_raw_fd(),
+            UFFDIO_REGISTER as libc::Ioctl,
+            &mut reg as *mut UffdioRegister,
+        )
+    };
+    if ret != 0 {
+        return Err(GuestMemoryFromUffdError::RegisterMinor(
+            std::io::Error::last_os_error(),
+        ));
+    }
+    Ok(())
+}
+
+fn create_guest_memory_shared_file(
+    path: &Path,
+    mem_state: &GuestMemoryState,
+    track_dirty_pages: bool,
+    huge_pages: HugePageConfig,
+) -> Result<(Vec<GuestRegionMmap>, Vec<GuestRegionUffdMapping>), GuestMemoryFromUffdError> {
+    let file = File::open(path).map_err(GuestMemoryFromUffdError::OpenSharedFile)?;
+    let guest_memory =
+        memory::snapshot_file(file, &mem_state.regions(), track_dirty_pages, huge_pages)?;
+    Ok(uffd_mappings(guest_memory, huge_pages))
 }
 
 fn create_guest_memory(
@@ -676,6 +752,13 @@ fn create_guest_memory(
     huge_pages: HugePageConfig,
 ) -> Result<(Vec<GuestRegionMmap>, Vec<GuestRegionUffdMapping>), GuestMemoryFromUffdError> {
     let guest_memory = memory::anonymous(&mem_state.regions(), track_dirty_pages, huge_pages)?;
+    Ok(uffd_mappings(guest_memory, huge_pages))
+}
+
+fn uffd_mappings(
+    guest_memory: Vec<GuestRegionMmap>,
+    huge_pages: HugePageConfig,
+) -> (Vec<GuestRegionMmap>, Vec<GuestRegionUffdMapping>) {
     let mut backend_mappings = Vec::with_capacity(guest_memory.len());
     let mut offset = 0;
     for mem_region in guest_memory.iter() {
@@ -690,7 +773,7 @@ fn create_guest_memory(
         offset += mem_region.size() as u64;
     }
 
-    Ok((guest_memory, backend_mappings))
+    (guest_memory, backend_mappings)
 }
 
 fn send_uffd_handshake(
@@ -1093,6 +1176,110 @@ mod tests {
         assert_eq!(uffd_regions[0].size, 0x20000);
         assert_eq!(uffd_regions[0].offset, 0);
         assert_eq!(uffd_regions[0].page_size, HugePageConfig::None.page_size());
+    }
+
+    #[test]
+    fn test_shared_file_missing_and_minor_faults() {
+        use std::os::unix::fs::FileExt;
+        const PAGE: usize = 4096;
+        const SIZE: usize = 0x20000;
+        const UFFD_USER_MODE_ONLY: i32 = 1;
+        const UFFD_API: u64 = 0xAA;
+        const UFFDIO_API: u32 = 0xC018_AA3F;
+        const UFFDIO_CONTINUE: u32 = 0xC020_AA07;
+        const UFFD_EVENT_PAGEFAULT: u8 = 0x12;
+        const FLAG_MINOR: u64 = 4;
+
+        let tmp = TempFile::new_with_prefix("/dev/shm/fc-shared-uffd-").unwrap();
+        let file = tmp.as_file();
+        file.set_len(SIZE as u64).unwrap();
+        // Page 0 is already in the shared file (filled for another VM); page 1 is a hole.
+        file.write_all_at(&[0xAA; PAGE], 0).unwrap();
+
+        let mem_state = GuestMemoryState {
+            regions: vec![GuestMemoryRegionState {
+                base_address: 0,
+                size: SIZE,
+                region_type: GuestRegionType::Dram,
+                plugged: vec![true],
+            }],
+        };
+        let (_mem, mappings) =
+            create_guest_memory_shared_file(tmp.as_path(), &mem_state, false, HugePageConfig::None)
+                .unwrap();
+        let base = mappings[0].base_host_virt_addr;
+
+        // `/dev/userfaultfd` is root-only on most hosts and the crate will not fall back to the
+        // syscall, so create a user-mode-only descriptor directly.
+        // The kernel fails poll() on a blocking userfaultfd, hence O_NONBLOCK.
+        let flags = libc::O_CLOEXEC | libc::O_NONBLOCK | UFFD_USER_MODE_ONLY;
+        // SAFETY: plain syscall; the returned fd is owned by `uffd` below.
+        let fd = unsafe { libc::syscall(libc::SYS_userfaultfd, flags) };
+        let fd = i32::try_from(fd).unwrap();
+        assert!(fd >= 0, "{}", std::io::Error::last_os_error());
+        // SAFETY: `fd` is a fresh userfaultfd descriptor that nothing else owns.
+        let uffd = unsafe { <Uffd as std::os::fd::FromRawFd>::from_raw_fd(fd) };
+        let mut api = [UFFD_API, 0, 0];
+        // SAFETY: `api` matches `struct uffdio_api`.
+        let ret = unsafe { libc::ioctl(fd, UFFDIO_API as libc::Ioctl, api.as_mut_ptr()) };
+        assert_eq!(ret, 0, "{}", std::io::Error::last_os_error());
+        register_missing_and_minor(&uffd, base, SIZE as u64).unwrap();
+
+        let guest = std::thread::spawn(move || {
+            let p = base as *mut u8;
+            // SAFETY: both pages lie inside the registered mapping, which outlives the thread.
+            unsafe {
+                let a = p.read_volatile();
+                let b = p.add(PAGE).read_volatile();
+                p.write_volatile(0x11);
+                (a, b)
+            }
+        });
+
+        let mut kinds = Vec::new();
+        for _ in 0..2 {
+            let mut pfd = libc::pollfd {
+                fd: uffd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: polls one valid descriptor.
+            let ready = unsafe { libc::poll(&mut pfd, 1, 5000) };
+            assert!(
+                ready == 1 && pfd.revents & libc::POLLIN != 0,
+                "no fault after 5s"
+            );
+            let mut msg = [0u8; 32];
+            // SAFETY: reads one `struct uffd_msg` into a 32-byte buffer.
+            let n = unsafe { libc::read(uffd.as_raw_fd(), msg.as_mut_ptr().cast(), 32) };
+            assert_eq!(n, 32);
+            assert_eq!(msg[0], UFFD_EVENT_PAGEFAULT);
+            let flags = u64::from_ne_bytes(msg[8..16].try_into().unwrap());
+            let addr = u64::from_ne_bytes(msg[16..24].try_into().unwrap()) & !(PAGE as u64 - 1);
+            let minor = flags & FLAG_MINOR != 0;
+            kinds.push((addr - base, minor));
+            if !minor {
+                // The handler fills the shared file once, then maps it.
+                file.write_all_at(&[0xBB; PAGE], addr - base).unwrap();
+            }
+            let mut cont = [addr, PAGE as u64, 0u64, 0u64];
+            // SAFETY: `cont` matches `struct uffdio_continue`.
+            let ret = unsafe {
+                libc::ioctl(
+                    uffd.as_raw_fd(),
+                    UFFDIO_CONTINUE as libc::Ioctl,
+                    cont.as_mut_ptr(),
+                )
+            };
+            assert_eq!(ret, 0, "{}", std::io::Error::last_os_error());
+        }
+
+        assert_eq!(guest.join().unwrap(), (0xAA, 0xBB));
+        assert_eq!(kinds, vec![(0, true), (PAGE as u64, false)]);
+        // The guest write was copied privately; the shared file is unchanged.
+        let mut page0 = [0u8; 1];
+        file.read_exact_at(&mut page0, 0).unwrap();
+        assert_eq!(page0[0], 0xAA);
     }
 
     #[test]
