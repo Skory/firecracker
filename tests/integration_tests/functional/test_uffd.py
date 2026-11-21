@@ -4,6 +4,7 @@
 
 import os
 import re
+import time
 import uuid
 from pathlib import Path
 
@@ -12,7 +13,12 @@ import requests
 
 from framework import defs
 from framework.artifacts import GUEST_KERNEL_DEFAULT, pin_guest_kernel
-from framework.utils import Timeout, check_output
+from framework.utils import (
+    Timeout,
+    check_output,
+    make_guest_dirty_memory,
+    wait_for_balloon_actual,
+)
 from framework.vm_backend import VM_BACKEND_KVM, pin_vm_backend
 
 # KVM-only: snapshotting is not available on enclave VMs.
@@ -227,4 +233,89 @@ def test_shared_memory_mode(microvm_factory, guest_kernel, rootfs, shared_file):
     _, stdout, _ = vm1.ssh.check_output(f"cat {SHARED_PAGE_FILE}")
     assert stdout.strip() == SHARED_PAGE_DATA
 
+    assert_shared_file_unchanged(shared_file, snapshot.mem)
+
+
+def guest_memory_vmas(pid, shared_file):
+    """Parse /proc/<pid>/maps of Firecracker.
+
+    Return the total number of VMAs and the anonymous VMAs that lie inside
+    guest memory, which is otherwise mapped from the shared file.
+    """
+    inode = shared_file.stat().st_ino
+    lines = Path(f"/proc/{pid}/maps").read_text(encoding="utf-8").splitlines()
+    vmas = []
+    for line in lines:
+        fields = line.split()
+        start, end = (int(addr, 16) for addr in fields[0].split("-"))
+        vmas.append((start, end, int(fields[4])))
+    shared = [(start, end) for start, end, ino in vmas if ino == inode]
+    low = min(start for start, _ in shared)
+    high = max(end for _, end in shared)
+    anonymous = [
+        (start, end)
+        for start, end, ino in vmas
+        if ino == 0 and low <= start and end <= high
+    ]
+    return len(lines), anonymous
+
+
+@pin_guest_kernel(GUEST_KERNEL_DEFAULT)
+def test_shared_memory_mode_balloon(
+    microvm_factory, guest_kernel, rootfs, shared_file
+):
+    """
+    Test the balloon on a microVM restored in uffd shared memory mode.
+
+    Firecracker frees balloon ranges by mapping anonymous memory over the
+    private file mapping. Those ranges read as zeros, the shared file does
+    not change, and each range splits the guest memory mapping.
+    """
+    basevm = microvm_factory.build(guest_kernel, rootfs)
+    basevm.spawn()
+    basevm.basic_config(vcpu_count=2, mem_size_mib=256)
+    basevm.add_net_iface()
+    basevm.api.balloon.put(
+        amount_mib=0,
+        deflate_on_oom=True,
+        stats_polling_interval_s=1,
+        free_page_reporting=True,
+    )
+    basevm.start()
+    snapshot = basevm.snapshot_full()
+    basevm.kill()
+
+    vm = restore_shared(microvm_factory, snapshot, shared_file)
+    vm.ssh.check_output("true")
+    pid = vm.firecracker_pid
+    vmas_restored, anonymous = guest_memory_vmas(pid, shared_file)
+    assert not anonymous
+
+    # Inflate: the guest hands pages to the balloon and never touches them.
+    vm.api.balloon.patch(amount_mib=128)
+    wait_for_balloon_actual(vm, 128, timeout_s=30)
+    vmas_inflated, anonymous = guest_memory_vmas(pid, shared_file)
+    assert anonymous
+    with open(f"/proc/{pid}/mem", "rb") as mem:
+        for start, end in anonymous:
+            mem.seek(start)
+            data = mem.read(end - start)
+            assert data.count(0) == len(data), f"{start:#x}-{end:#x} is not zero"
+
+    vm.api.balloon.patch(amount_mib=0)
+    wait_for_balloon_actual(vm, 0, timeout_s=30)
+
+    # fillmem dirties memory and exits. The guest then reports the freed
+    # pages, which takes up to 2 seconds.
+    make_guest_dirty_memory(vm.ssh, amount_mib=64)
+    time.sleep(3)
+    vmas_reported, _ = guest_memory_vmas(pid, shared_file)
+    print(
+        f"Firecracker VMAs: {vmas_restored} after restore, {vmas_inflated} "
+        f"with the balloon inflated, {vmas_reported} after free page reporting"
+    )
+    assert vmas_inflated > vmas_restored
+    assert vmas_reported > vmas_restored
+
+    vm.ssh.check_output("true")
     assert_shared_file_unchanged(shared_file, snapshot.mem)
