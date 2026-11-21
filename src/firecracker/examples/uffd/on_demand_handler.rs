@@ -4,10 +4,15 @@
 //! Provides functionality for a userspace page fault handler
 //! which loads the whole region from the backing memory file
 //! when a page fault occurs.
+//!
+//! Usage: `on_demand_handler <socket> <memory file> [<shared file>]`. With a shared file, the
+//! handler serves shared memory mode: it fills the shared file from the memory file and maps
+//! pages with `UFFDIO_CONTINUE`. Pass the same path as `shared_file_path` in the snapshot-load
+//! API.
 
 mod uffd_utils;
 
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::os::unix::net::UnixListener;
 
 use uffd_utils::{Runtime, UffdHandler};
@@ -16,14 +21,38 @@ fn main() {
     let mut args = std::env::args();
     let uffd_sock_path = args.nth(1).expect("No socket path given");
     let mem_file_path = args.next().expect("No memory file given");
+    let shared_file = args.next().map(|path| {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .expect("Cannot open shared file")
+    });
 
     let file = File::open(mem_file_path).expect("Cannot open memfile");
+
+    // Firecracker maps the shared file before it connects to the socket, and refuses a file
+    // shorter than guest memory, so size it before listening.
+    if let Some(shared_file) = &shared_file {
+        let mem_len = file.metadata().expect("Cannot stat memfile").len();
+        let shared_len = shared_file
+            .metadata()
+            .expect("Cannot stat shared file")
+            .len();
+        if shared_len < mem_len {
+            shared_file
+                .set_len(mem_len)
+                .expect("Cannot resize shared file");
+        }
+    }
 
     // Get Uffd from UDS. We'll use the uffd to handle PFs for Firecracker.
     let listener = UnixListener::bind(uffd_sock_path).expect("Cannot bind to socket path");
     let (stream, _) = listener.accept().expect("Cannot listen on UDS socket");
 
-    let mut runtime = Runtime::new(stream, file);
+    let mut runtime = Runtime::with_shared_file(stream, file, shared_file);
     runtime.install_panic_hook();
     runtime.run(|uffd_handler: &mut UffdHandler| {
         // !DISCLAIMER!

@@ -1114,8 +1114,13 @@ class Microvm:
         pmem_overrides: Optional[dict] = None,
         huge_pages: Optional[HugePagesConfig] = None,
         uffd_handler_name: str = None,
+        uffd_shared_file: Optional[Path] = None,
     ):
         """Restore a snapshot
+
+        With `uffd_shared_file` (a host path), the microVM restores in uffd
+        shared memory mode, backed by that file. It must be on the same tmpfs
+        as the jail, so that every microVM sharing it maps the same file.
 
         `drive_overrides` and `pmem_overrides` map drive and pmem device IDs to
         the host paths of the files that back them instead of the files recorded
@@ -1125,11 +1130,21 @@ class Microvm:
 
         jailed_snapshot = snapshot.copy_to_chroot(Path(self.chroot()))
 
+        jailed_shared_file = None
+        if uffd_shared_file is not None:
+            assert uffd_handler_name, "shared memory mode needs a uffd handler"
+            # A copy instead of a hard link would not be shared.
+            assert (
+                Path(uffd_shared_file).stat().st_dev == Path(self.chroot()).stat().st_dev
+            ), "the shared memory file must be on the same filesystem as the jail"
+            jailed_shared_file = self.create_jailed_resource(uffd_shared_file)
+
         if uffd_handler_name:
             self.uffd_handler = spawn_pf_handler(
                 self,
                 uffd_handler(uffd_handler_name, binary_dir=self.fc_binary_path.parent),
                 jailed_snapshot,
+                shared_file=jailed_shared_file,
             )
 
         jailed_mem = Path("/") / jailed_snapshot.mem.name
@@ -1157,6 +1172,8 @@ class Microvm:
                 "backend_type": "Uffd",
                 "backend_path": str(self.uffd_handler.socket_path),
             }
+            if jailed_shared_file is not None:
+                mem_backend["shared_file_path"] = jailed_shared_file
 
         for key, value in jailed_snapshot.meta.items():
             if key == "kernel_file":

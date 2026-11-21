@@ -12,9 +12,11 @@
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::fs::File;
+use std::os::unix::fs::FileExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
 use std::os::unix::net::UnixStream;
 use std::ptr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -53,6 +55,8 @@ pub struct UffdHandler {
     pub mem_regions: Vec<GuestRegionUffdMapping>,
     pub page_size: usize,
     backing_buffer: *const u8,
+    /// Shared memory mode: the file that Firecracker maps `MAP_PRIVATE` as guest memory.
+    shared_file: Option<Arc<File>>,
     uffd: Uffd,
 }
 
@@ -97,7 +101,12 @@ impl UffdHandler {
         panic!("Could not get UFFD and mappings after 5 retries");
     }
 
-    pub fn from_unix_stream(stream: &UnixStream, backing_buffer: *const u8, size: usize) -> Self {
+    pub fn from_unix_stream(
+        stream: &UnixStream,
+        backing_buffer: *const u8,
+        size: usize,
+        shared_file: Option<Arc<File>>,
+    ) -> Self {
         let (body, file) = Self::get_mappings_and_file(stream);
         let mappings =
             serde_json::from_str::<Vec<GuestRegionUffdMapping>>(&body).unwrap_or_else(|_| {
@@ -123,6 +132,7 @@ impl UffdHandler {
             mem_regions: mappings,
             page_size,
             backing_buffer,
+            shared_file,
             uffd,
         }
     }
@@ -151,7 +161,10 @@ impl UffdHandler {
 
         for region in self.mem_regions.iter() {
             if region.contains(fault_page_addr) {
-                return self.populate_from_file(region, fault_page_addr, len);
+                return match &self.shared_file {
+                    Some(file) => self.populate_shared(file, region, fault_page_addr, len),
+                    None => self.populate_from_file(region, fault_page_addr, len),
+                };
             }
         }
 
@@ -190,6 +203,79 @@ impl UffdHandler {
 
         true
     }
+
+    /// Shared memory mode. A page already in the shared file (a minor fault) only needs
+    /// `UFFDIO_CONTINUE`. A page missing from it (a missing fault) is written into the file
+    /// first. `UFFDIO_COPY` must not be used: it would install a private anonymous page and
+    /// leave the hole in the file, so the page would never be shared.
+    fn populate_shared(
+        &self,
+        file: &File,
+        region: &GuestRegionUffdMapping,
+        dst: u64,
+        len: usize,
+    ) -> bool {
+        match self.uffd_continue(dst, len) {
+            // The page is not in the shared file yet.
+            Err(libc::EFAULT) => {}
+            result => return Self::continue_result(result),
+        }
+        let offset = region.offset + (dst - region.base_host_virt_addr);
+        // SAFETY: `offset + len` lies within the snapshot memory file that `backing_buffer` maps.
+        let src =
+            unsafe { std::slice::from_raw_parts(self.backing_buffer.add(offset as usize), len) };
+        // Handlers serving other microVMs may write the same page concurrently. They all write
+        // the same snapshot bytes, so the page contents never change once present.
+        file.write_all_at(src, offset)
+            .expect("Failed to write to the shared memory file");
+        Self::continue_result(self.uffd_continue(dst, len))
+    }
+
+    fn continue_result(result: Result<(), i32>) -> bool {
+        match result {
+            Ok(()) => true,
+            // Another fault on the same page already mapped it.
+            Err(libc::EEXIST) => true,
+            // A `remove` event is pending: retry after reading it.
+            Err(libc::EAGAIN) => false,
+            Err(errno) => panic!(
+                "UFFDIO_CONTINUE failed: {}",
+                std::io::Error::from_raw_os_error(errno)
+            ),
+        }
+    }
+
+    /// Issues `UFFDIO_CONTINUE`. The `userfaultfd` crate offers it only behind its `linux5_13`
+    /// feature, which regenerates kernel bindings at build time.
+    fn uffd_continue(&self, dst: u64, len: usize) -> Result<(), i32> {
+        #[repr(C)]
+        struct UffdioContinue {
+            start: u64,
+            len: u64,
+            mode: u64,
+            mapped: i64,
+        }
+        const UFFDIO_CONTINUE: u32 = 0xC020_AA07;
+        let mut arg = UffdioContinue {
+            start: dst,
+            len: len as u64,
+            mode: 0,
+            mapped: 0,
+        };
+        // SAFETY: `arg` matches the kernel's `struct uffdio_continue`.
+        let ret = unsafe {
+            libc::ioctl(
+                self.uffd.as_raw_fd(),
+                UFFDIO_CONTINUE as libc::Ioctl,
+                &raw mut arg,
+            )
+        };
+        if ret == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error().raw_os_error().unwrap())
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -198,11 +284,22 @@ pub struct Runtime {
     backing_file: File,
     backing_memory: *mut u8,
     backing_memory_size: usize,
+    shared_file: Option<Arc<File>>,
     uffds: HashMap<i32, UffdHandler>,
 }
 
 impl Runtime {
     pub fn new(stream: UnixStream, backing_file: File) -> Self {
+        Self::with_shared_file(stream, backing_file, None)
+    }
+
+    /// With `shared_file`, serves shared memory mode: Firecracker maps `shared_file` as guest
+    /// memory, and the handler fills it from `backing_file`.
+    pub fn with_shared_file(
+        stream: UnixStream,
+        backing_file: File,
+        shared_file: Option<File>,
+    ) -> Self {
         let file_meta = backing_file
             .metadata()
             .expect("can not get backing file metadata");
@@ -228,6 +325,7 @@ impl Runtime {
             backing_file,
             backing_memory: ret.cast(),
             backing_memory_size,
+            shared_file: shared_file.map(Arc::new),
             uffds: HashMap::default(),
         }
     }
@@ -308,6 +406,7 @@ impl Runtime {
                             &self.stream,
                             self.backing_memory,
                             self.backing_memory_size,
+                            self.shared_file.clone(),
                         );
                         pollfds.push(libc::pollfd {
                             fd: handler.uffd.as_raw_fd(),
