@@ -1196,17 +1196,13 @@ mod tests {
         // Page 0 is already in the shared file (filled for another VM); page 1 is a hole.
         file.write_all_at(&[0xAA; PAGE], 0).unwrap();
 
-        let mem_state = GuestMemoryState {
-            regions: vec![GuestMemoryRegionState {
-                base_address: 0,
-                size: SIZE,
-                region_type: GuestRegionType::Dram,
-                plugged: vec![true],
-            }],
-        };
-        let (_mem, mappings) =
-            create_guest_memory_shared_file(tmp.as_path(), &mem_state, false, HugePageConfig::None)
-                .unwrap();
+        let (_mem, mappings) = create_guest_memory_shared_file(
+            tmp.as_path(),
+            &shared_file_mem_state(SIZE),
+            false,
+            HugePageConfig::None,
+        )
+        .unwrap();
         let base = mappings[0].base_host_virt_addr;
 
         // `/dev/userfaultfd` is root-only on most hosts and the crate will not fall back to the
@@ -1280,6 +1276,39 @@ mod tests {
         let mut page0 = [0u8; 1];
         file.read_exact_at(&mut page0, 0).unwrap();
         assert_eq!(page0[0], 0xAA);
+    }
+
+    fn shared_file_mem_state(size: usize) -> GuestMemoryState {
+        GuestMemoryState {
+            regions: vec![GuestMemoryRegionState {
+                base_address: 0,
+                size,
+                region_type: GuestRegionType::Dram,
+                plugged: vec![true],
+            }],
+        }
+    }
+
+    #[test]
+    fn test_shared_file_shorter_than_guest_memory() {
+        let tmp = TempFile::new_with_prefix("/dev/shm/fc-shared-uffd-").unwrap();
+        tmp.as_file().set_len(0x10000).unwrap();
+
+        let result = create_guest_memory_shared_file(
+            tmp.as_path(),
+            &shared_file_mem_state(0x20000),
+            false,
+            HugePageConfig::None,
+        );
+
+        // A guest access past the end of a shmem file raises SIGBUS, which userfaultfd cannot
+        // catch, so mapping a short file must fail.
+        assert!(matches!(
+            result,
+            Err(GuestMemoryFromUffdError::Restore(
+                MemoryError::OffsetTooLarge
+            ))
+        ));
     }
 
     #[test]
