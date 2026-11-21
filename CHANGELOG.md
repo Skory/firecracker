@@ -51,6 +51,11 @@ and this project adheres to
   files of pmem devices when loading a snapshot. See
   [Overriding host resources](docs/snapshotting/snapshot-support.md#overriding-host-resources)
   for more information.
+- Added an optional `mem_backend.shared_file_path` field to the
+  `PUT /snapshot/load` API for the `Uffd` backend. Guest memory then maps that
+  file `MAP_PRIVATE` and registers it for missing and minor faults, so microVMs
+  restored from the same snapshot store unmodified pages once per host. See
+  [Shared memory mode](docs/snapshotting/handling-page-faults-on-snapshot-resume.md#shared-memory-mode).
 
 ### Changed
 
